@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use PolyLauncher::{apply_patch, create_patch};
+use polylauncher::{apply_patch, create_patch};
 
 #[derive(Parser)]
 #[command(name = "PolyLauncher CLI", author = "SpideyZac", version = env!("CARGO_PKG_VERSION"), about = "A CLI tool for PolyLauncher.")]

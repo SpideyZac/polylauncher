@@ -1,9 +1,10 @@
 [package]
-name = "PolyLauncher"
+name = "polylauncher"
 version = "0.0.1"
 description = "PolyTrack Launcher"
 authors = ["SpideyZac"]
 edition = "2021"
+default-run = "PolyLauncher"
 
 [[bin]]
 name = "PolyLauncher"

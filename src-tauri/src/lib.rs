@@ -1,6 +1,3 @@
-// PolyLauncher is not snake_case so we disable the lint for this file.
-#![allow(non_snake_case)]
-
 use std::{
     collections::HashSet,
     fs::{read, remove_file, write},
