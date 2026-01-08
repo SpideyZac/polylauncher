@@ -1,34 +1,37 @@
+// TODO: Don't load entire files into memory at once for large files.
+
 use std::{
     collections::HashSet,
-    fs::{read, remove_file, write},
+    fs::{create_dir_all, read, remove_dir, remove_file, symlink_metadata, write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context};
-use files_diff::{apply, diff, CompressAlgorithm, DiffAlgorithm, Patch};
+use anyhow::{anyhow, ensure, Context};
+use files_diff::{apply, diff, hash, CompressAlgorithm, DiffAlgorithm, Patch};
 use rkyv::{access, deserialize, rancor::Error, to_bytes, Archive, Deserialize, Serialize};
 use walkdir::WalkDir;
+
+const PATCH_PACKAGE_VERSION: u32 = 1;
 
 /// Enum representing the type of operation a patch entry represents.
 #[derive(Archive, Serialize, Deserialize)]
 enum PatchOperation {
-    Add,    // File is added
-    Remove, // File is removed
-    Modify, // File is modified
+    Add(Vec<u8>),  // File is added
+    Remove,        // File is removed
+    Modify(Patch), // File is modified
 }
 
 /// A single entry in a patch, may contain the diff and relative path info.
 #[derive(Archive, Serialize, Deserialize)]
 struct PatchEntry {
-    pub patch: Option<Patch>,      // Patch data if applicable
     pub operation: PatchOperation, // Operation type
     pub rel_path: String,          // Relative file path
 }
 
 impl PatchEntry {
-    pub fn new(patch: Option<Patch>, operation: PatchOperation, rel_path: String) -> Self {
+    pub fn new(operation: PatchOperation, rel_path: String) -> Self {
+        let rel_path = rel_path.replace("\\", "/"); // Normalize to forward slashes
         Self {
-            patch,
             operation,
             rel_path,
         }
@@ -38,12 +41,13 @@ impl PatchEntry {
 /// A package containing multiple patch entries.
 #[derive(Archive, Serialize, Deserialize)]
 struct PatchPackage {
+    pub version: u32, // Version for future compatibility
     pub entries: Vec<PatchEntry>,
 }
 
 impl PatchPackage {
-    pub fn new(entries: Vec<PatchEntry>) -> Self {
-        Self { entries }
+    pub fn new(version: u32, entries: Vec<PatchEntry>) -> Self {
+        Self { version, entries }
     }
 }
 
@@ -87,6 +91,8 @@ pub fn create_patch(patch_loc: &Path, path1: &Path, path2: &Path) -> anyhow::Res
 
     // Unique set of all file paths across both directories
     let unique_paths: HashSet<PathBuf> = paths1.into_iter().chain(paths2).collect();
+    let mut unique_paths: Vec<_> = unique_paths.into_iter().collect();
+    unique_paths.sort();
 
     for rel_path in unique_paths {
         let file1 = path1.join(&rel_path);
@@ -103,23 +109,33 @@ pub fn create_patch(patch_loc: &Path, path1: &Path, path2: &Path) -> anyhow::Res
                 let data2 = read(&file2)
                     .with_context(|| format!("Failed to read file: {}", file2.display()))?;
 
-                if let Ok(patch) = diff(
+                if data1 == data2 {
+                    // No changes, skip
+                    continue;
+                }
+
+                let patch = diff(
                     &data1,
                     &data2,
                     DiffAlgorithm::Rsync020,
                     CompressAlgorithm::Zstd,
-                ) {
-                    entries.push(PatchEntry::new(
-                        Some(patch),
-                        PatchOperation::Modify,
-                        rel_path.to_string_lossy().to_string(),
-                    ));
-                }
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to compute diff for file: {}: {:?}",
+                        rel_path.display(),
+                        e
+                    )
+                })?;
+
+                entries.push(PatchEntry::new(
+                    PatchOperation::Modify(patch),
+                    rel_path.to_string_lossy().to_string(),
+                ));
             }
             (true, false) => {
                 // File removed in second directory
                 entries.push(PatchEntry::new(
-                    None,
                     PatchOperation::Remove,
                     rel_path.to_string_lossy().to_string(),
                 ));
@@ -129,23 +145,8 @@ pub fn create_patch(patch_loc: &Path, path1: &Path, path2: &Path) -> anyhow::Res
                 let data2 = read(&file2)
                     .with_context(|| format!("Failed to read file: {}", file2.display()))?;
 
-                let patch = diff(
-                    &[], // Empty original file
-                    &data2,
-                    DiffAlgorithm::Rsync020,
-                    CompressAlgorithm::Zstd,
-                )
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to create addition diff for file {}: {:?}",
-                        rel_path.display(),
-                        e
-                    )
-                })?;
-
                 entries.push(PatchEntry::new(
-                    Some(patch),
-                    PatchOperation::Add,
+                    PatchOperation::Add(data2),
                     rel_path.to_string_lossy().to_string(),
                 ));
             }
@@ -156,7 +157,7 @@ pub fn create_patch(patch_loc: &Path, path1: &Path, path2: &Path) -> anyhow::Res
     }
 
     // Serialize and write the patch package to file
-    let patch_package = PatchPackage::new(entries);
+    let patch_package = PatchPackage::new(PATCH_PACKAGE_VERSION, entries);
     let serialized = to_bytes::<Error>(&patch_package)
         .map_err(|e| anyhow!("Failed to serialize patch package: {:?}", e))?;
 
@@ -166,13 +167,62 @@ pub fn create_patch(patch_loc: &Path, path1: &Path, path2: &Path) -> anyhow::Res
     Ok(())
 }
 
+/// Verifies that a path and all its components are not symlinks.
+fn verify_no_symlinks_in_path(path: &Path) -> anyhow::Result<()> {
+    let mut cur = PathBuf::new();
+    for comp in path.components() {
+        cur.push(comp);
+        if let Ok(meta) = symlink_metadata(&cur) {
+            ensure!(
+                !meta.file_type().is_symlink(),
+                "Refusing to traverse symlink component: {}",
+                cur.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Safely removes empty parent directories up to (but not including) the target path.
+fn remove_empty_parents(file_path: &Path, target_path: &Path) {
+    let mut current_path = file_path.parent();
+    while let Some(dir) = current_path {
+        // Stop if we reach the target path
+        if dir == target_path {
+            break;
+        }
+
+        match dir.read_dir() {
+            Ok(entries) => {
+                let mut entries = entries;
+                if entries.next().is_none() {
+                    // Directory is empty, try to remove it (ignore errors)
+                    let _ = remove_dir(dir);
+                    current_path = dir.parent();
+                } else {
+                    break; // Directory has entries
+                }
+            }
+            _ => break, // Can't read directory
+        }
+    }
+}
+
 /// Applies a patch package to a target directory.
+/// NOTE: It is recommended to back up data before applying patches. This operation may corrupt data.
 pub fn apply_patch(patch_loc: &Path, target_path: &Path) -> anyhow::Result<()> {
+    // Verify target path is not a symlink
+    let meta = symlink_metadata(target_path)?;
+    ensure!(
+        !meta.file_type().is_symlink(),
+        "Target path must not be a symlink"
+    );
+
     // Read the serialized patch package
     let patch_data = read(patch_loc)
         .with_context(|| format!("Failed to read patch file: {}", patch_loc.display()))?;
 
-    // Access archived patch package (without full deserialization)
+    // Access archived patch package (without full deserialization - calling methods on it is unsafe)
     let patch_package_archive = access::<ArchivedPatchPackage, Error>(&patch_data)
         .map_err(|e| anyhow!("Failed to access archived patch package: {:?}", e))?;
 
@@ -180,55 +230,131 @@ pub fn apply_patch(patch_loc: &Path, target_path: &Path) -> anyhow::Result<()> {
     let patch_package = deserialize::<PatchPackage, Error>(patch_package_archive)
         .map_err(|e| anyhow!("Failed to deserialize patch package: {:?}", e))?;
 
+    // Verify version compatibility
+    ensure!(
+        patch_package.version == PATCH_PACKAGE_VERSION,
+        "Unsupported patch version: {} (expected {})",
+        patch_package.version,
+        PATCH_PACKAGE_VERSION
+    );
+
     for entry in patch_package.entries {
-        let file_path = target_path.join(&entry.rel_path);
+        let joined = target_path.join(&entry.rel_path);
+
+        // Normalize path without touching filesystem
+        let normalized = joined.components().fold(PathBuf::new(), |mut acc, c| {
+            match c {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {
+                    // Skip "." components
+                }
+                _ => {
+                    acc.push(c);
+                }
+            }
+            acc
+        });
+
+        // Ensure it stays within target_path
+        ensure!(
+            normalized.starts_with(target_path),
+            "Patch entry path {} escapes target directory {}",
+            entry.rel_path,
+            target_path.display()
+        );
+
+        let file_path = normalized;
+
+        // Defense in depth: verify no symlinks in the entire path
+        verify_no_symlinks_in_path(&file_path)?;
 
         match entry.operation {
-            PatchOperation::Add => {
-                if let Some(patch) = entry.patch {
-                    // Apply addition patch (from empty data)
-                    let added_data = apply(&[], &patch).map_err(|e| {
-                        anyhow!(
-                            "Failed to apply addition patch to file {}: {:?}",
-                            file_path.display(),
-                            e
-                        )
-                    })?;
-
-                    write(&file_path, added_data).with_context(|| {
-                        format!("Failed to write added file: {}", file_path.display())
-                    })?;
-                }
-            }
-            PatchOperation::Remove => {
-                if file_path.exists() {
-                    remove_file(&file_path).with_context(|| {
-                        format!("Failed to remove file: {}", file_path.display())
-                    })?;
-                }
-            }
-            PatchOperation::Modify => {
-                if let Some(patch) = entry.patch {
-                    // Read current file and apply patch
-                    let original_data = read(&file_path).with_context(|| {
+            PatchOperation::Add(data) => {
+                // Ensure parent directories exist
+                if let Some(parent) = file_path.parent() {
+                    create_dir_all(parent).with_context(|| {
                         format!(
-                            "Failed to read file for modification: {}",
+                            "Failed to create parent directories for file: {}",
                             file_path.display()
                         )
                     })?;
-
-                    let modified_data = apply(&original_data, &patch).map_err(|e| {
-                        anyhow!(
-                            "Failed to apply patch to file {}: {:?}",
-                            file_path.display(),
-                            e
-                        )
-                    })?;
-
-                    write(&file_path, modified_data).with_context(|| {
-                        format!("Failed to write modified file: {}", file_path.display())
-                    })?;
                 }
+
+                // Final check: ensure we're not overwriting a symlink
+                if file_path.exists() {
+                    ensure!(
+                        !symlink_metadata(&file_path)?.file_type().is_symlink(),
+                        "Refusing to overwrite symlink: {}",
+                        file_path.display()
+                    );
+                }
+
+                write(&file_path, data).with_context(|| {
+                    format!("Failed to write added file: {}", file_path.display())
+                })?;
+            }
+            PatchOperation::Remove => {
+                if file_path.exists() {
+                    // Final check: ensure we're not removing a symlink
+                    ensure!(
+                        !symlink_metadata(&file_path)?.file_type().is_symlink(),
+                        "Refusing to remove symlink: {}",
+                        file_path.display()
+                    );
+
+                    remove_file(&file_path).with_context(|| {
+                        format!("Failed to remove file: {}", file_path.display())
+                    })?;
+
+                    // Safely remove empty parent directories
+                    remove_empty_parents(&file_path, target_path);
+                }
+            }
+            PatchOperation::Modify(patch) => {
+                // Final check: ensure we're not modifying a symlink
+                ensure!(
+                    !symlink_metadata(&file_path)?.file_type().is_symlink(),
+                    "Refusing to modify symlink: {}",
+                    file_path.display()
+                );
+
+                // Read current file and apply patch
+                let original_data = read(&file_path).with_context(|| {
+                    format!(
+                        "Failed to read file for modification: {}",
+                        file_path.display()
+                    )
+                })?;
+
+                // Verify the hash before applying patch
+                if hash(&original_data) != patch.before_hash {
+                    return Err(anyhow!(
+                        "Hash mismatch before applying patch to file: {}. File may have been modified.",
+                        file_path.display()
+                    ));
+                }
+
+                let modified_data = apply(&original_data, &patch).map_err(|e| {
+                    anyhow!(
+                        "Failed to apply patch to file {}: {:?}",
+                        file_path.display(),
+                        e
+                    )
+                })?;
+
+                // Verify the hash after applying patch
+                if hash(&modified_data) != patch.after_hash {
+                    return Err(anyhow!(
+                        "Hash mismatch after applying patch to file: {}. Patch may be corrupted.",
+                        file_path.display()
+                    ));
+                }
+
+                write(&file_path, modified_data).with_context(|| {
+                    format!("Failed to write modified file: {}", file_path.display())
+                })?;
             }
         }
     }
