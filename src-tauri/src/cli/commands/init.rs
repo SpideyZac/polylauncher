@@ -1,8 +1,5 @@
 use std::{
-    env::current_dir,
-    fs::{copy, create_dir_all, read_to_string},
-    path::Path,
-    process::{Command, Stdio},
+    env::current_dir, fs::{copy, create_dir_all, read_dir, read_to_string, write}, io, path::Path, process::{Command, Stdio}
 };
 
 use colored::Colorize;
@@ -108,17 +105,44 @@ pub fn handle_init(polytrack_version: String) -> PolyResult<()> {
     let template_dir = get_template_project_dir()?;
     if template_dir.exists() {
         println!("{}", "Copying template project files...".blue());
-        for entry in template_dir.read_dir()? {
-            let entry = entry?;
-            let dest_path = cur_working_dir.join(entry.file_name());
-            if entry.path().is_dir() {
-                create_dir_all(&dest_path)?;
-                copy(entry.path(), &dest_path)?;
-            } else {
-                copy(entry.path(), &dest_path)?;
-            }
+        copy_dir_recursive(&template_dir, &cur_working_dir)?;
+        
+        // Update polylauncher.json with the correct version
+        let polylauncher_json_path = cur_working_dir.join("polylauncher.json");
+        if polylauncher_json_path.exists() {
+            let mut polylauncher_json = read_to_string(&polylauncher_json_path)?;
+            polylauncher_json = polylauncher_json.replace("<placeholder>", &version);
+            write(&polylauncher_json_path, polylauncher_json)?;
         }
+
         println!("{}", "Template project files copied.".green().bold());
+    }
+
+    // Copy version's files to patched/ directory in current directory
+    let patched_dir = cur_working_dir.join("patched");
+    create_dir_all(&patched_dir)?;
+    println!("{}", "Copying version files to patched/ directory...".blue());
+    copy_dir_recursive(&install_dir, &patched_dir)?;
+
+    // TODO: Additional setup steps can be added here
+
+    Ok(())
+}
+
+/// Copies files from source to destination directory recursively
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    create_dir_all(dst)?;
+
+    for entry in read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            copy(&src_path, &dst_path)?;
+        }
     }
 
     Ok(())
